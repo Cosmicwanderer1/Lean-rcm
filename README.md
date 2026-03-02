@@ -1,4 +1,5 @@
-# RTAP — RAG-CoS-MCTS 协作式定理证明框架
+#Lean-RCM
+# RAG-CoS-MCTS 协作式定理证明框架
 
 **Retrieval-Augmented and Metavariable-Aware Chain of States with Monte Carlo Tree Search**
 
@@ -6,7 +7,7 @@
 
 ## 项目简介
 
-RTAP 是一个面向 Lean4 的自动定理证明系统，基于三项核心创新：
+RCM 是一个面向 Lean4 的自动定理证明系统，基于三项核心创新：
 
 1. **DG-RASP**（双粒度检索增强状态规划）— 宏观层锚定中间状态，微观层生成具体策略
 2. **MAGC-MCTS**（元变量感知目标条件 MCTS）— 外层状态树 + 内层战术树的两级搜索
@@ -151,4 +152,4 @@ python -m src.trainer.expert_iteration \
 
 ---
 
-@author ygw
+@author hwj
