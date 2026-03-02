@@ -1,0 +1,256 @@
+# RAG-CoS-MCTS 数据流水线完整配置
+# @author ygw
+# 配置文件用于定义 Phase 2 数据处理流水线的全部参数
+# (Phase 2: CoS 数据抽取 + 检索数据构建 + Thought 标注 + 数据增强)
+# 更新日期: 2026-02-28
+
+# ============================================================
+# 全局配置
+# ============================================================
+global:
+  project_root: "/root/autodl-tmp/RTAP"
+  log_level: "INFO"                    # 日志级别: DEBUG, INFO, WARNING, ERROR
+  num_workers: 8                       # 并行工作进程数（15核CPU，留余量给系统）
+  random_seed: 42                      # 随机种子，确保可复现
+  device: "cuda"                       # 计算设备: cuda / cpu
+
+# ============================================================
+# 数据源配置
+# ============================================================
+data_source:
+  mathlib4_path: "/root/autodl-tmp/RTAP/data/raw/mathlib4"
+  lean_version: "v4.27.0"
+  # 需要排除的目录（测试文件、废弃文件等）
+  exclude_dirs:
+    - "test"
+    - "deprecated"
+    - ".lake"
+  # 支持的文件扩展名
+  file_extensions:
+    - ".lean"
+
+# ============================================================
+# 步骤一：全量追踪 (Ingestion & Tracing)
+# ============================================================
+trace_extraction:
+  enable: true
+  output_path: "/root/autodl-tmp/RTAP/data/processed/traces"
+  # LeanDojo 追踪参数
+  leandojo:
+    timeout_per_file: 300              # 单文件追踪超时（秒）
+    max_retries: 3                     # 失败重试次数
+    retry_delay: 5                     # 重试间隔（秒）
+    batch_size: 50                     # 每批处理文件数
+  # 过滤条件
+  filter:
+    min_proof_steps: 2                 # 最少证明步数
+    max_proof_steps: 200               # 最多证明步数
+    exclude_sorry: true                # 排除含 sorry 的证明
+    exclude_native_decide: true        # 排除 native_decide 证明
+    require_tactic_proof: true         # 仅保留 tactic 模式证明
+  # 输出格式
+  output_format: "jsonl"               # jsonl / parquet
+  # 断点续传
+  checkpoint:
+    enable: true
+    checkpoint_path: "/root/autodl-tmp/RTAP/data/processed/traces/.checkpoint"
+    save_interval: 100                 # 每处理 N 个文件保存一次检查点
+
+# ============================================================
+# 步骤二：状态链提取 (CoS Extraction)
+# ============================================================
+cos_extraction:
+  enable: true
+  input_path: "/root/autodl-tmp/RTAP/data/processed/traces"
+  output_path: "/root/autodl-tmp/RTAP/data/processed/cos_dataset"
+  # CoS 提取参数
+  min_steps: 3                         # 最小状态链步数
+  max_steps: 50                        # 最大状态链步数
+  # 关键 Tactic 类型（用于提取关键状态路标）
+  key_tactics:
+    - "have"
+    - "apply"
+    - "rw"
+    - "simp"
+    - "exact"
+    - "intro"
+    - "cases"
+    - "induction"
+    - "constructor"
+    - "refine"
+    - "calc"
+    - "obtain"
+  # 状态压缩策略
+  compression:
+    enable: true
+    # 压缩比：将 N 步证明压缩为约 N/ratio 个关键路标
+    target_ratio: 3
+    # 保留首尾状态
+    keep_first_last: true
+  # Pantograph 交互参数
+  pantograph:
+    executable: "/root/autodl-tmp/RTAP/workspace/PyPantograph/src/.lake/build/bin/repl"
+    timeout: 30                        # 单次交互超时（秒）
+    max_concurrent: 6                  # 最大并发 Pantograph 实例数（15核CPU）
+  # 输出格式
+  output_format: "jsonl"
+
+# ============================================================
+# 步骤三：思维回溯 (Thought Back-translation)
+# ============================================================
+thought_generation:
+  enable: true
+  input_path: "/root/autodl-tmp/RTAP/data/processed/cos_dataset"
+  output_path: "/root/autodl-tmp/RTAP/data/processed/cos_dataset"
+  # Teacher Model 配置
+  teacher_model:
+    # 支持: deepseek-v3, gpt-4o, deepseek-math, local
+    provider: "deepseek-v3"
+    model_name: "deepseek-chat"
+    api_base: "https://api.deepseek.com/v1"
+    api_key_env: "DEEPSEEK_API_KEY"    # 从环境变量读取 API Key
+    # 备用模型（主模型不可用时切换）
+    fallback:
+      provider: "openai"
+      model_name: "gpt-4o"
+      api_base: "https://api.openai.com/v1"
+      api_key_env: "OPENAI_API_KEY"
+  # 生成参数
+  generation:
+    temperature: 0.7
+    max_tokens: 512
+    top_p: 0.95
+    # 每个样本生成 N 个候选 Thought，取最优
+    num_candidates: 1
+  # Prompt 模板
+  prompt_template: |
+    You are a Lean4 proof reasoning annotator. Given one proof step with its before/after states and the tactic used, explain the reasoning behind this step.
+
+    [Proof Step]
+    S_pre: {state_pre}
+    Tactic: {tactic}
+    S_post: {state_post}
+
+    [Rules]
+    Write 1-2 sentences explaining the reasoning. You MUST:
+    - State which specific goal, hypothesis, or expression the tactic targets
+    - Describe how the proof state changes (what is eliminated, introduced, or rewritten)
+    - NEVER use vague phrases: "obviously", "clearly", "trivially", "it is easy to see", "straightforward"
+    - Do NOT restate the problem; only describe the reasoning
+    - Output the reasoning text directly with no numbering, headings, or prefixes
+  # 批处理参数
+  batch:
+    batch_size: 30                     # API 批量请求大小
+    max_concurrent_requests: 20        # 最大并发 API 请求数（异步模式）
+    rate_limit_rpm: 500                # 每分钟最大请求数
+    retry_on_failure: true
+    max_retries: 3
+  # 质量过滤
+  quality_filter:
+    min_length: 20                     # Thought 最小字符数
+    max_length: 500                    # Thought 最大字符数
+    # 必须包含的关键词（至少命中一个）
+    require_keywords: []
+    # 不允许出现的内容
+    forbidden_patterns:
+      - "I don't know"
+      - "I'm not sure"
+      - "无法确定"
+
+# ============================================================
+# 步骤四：数据增强 (Data Augmentation)
+# ============================================================
+augmentation:
+  enable: true
+  input_path: "/root/autodl-tmp/RTAP/data/processed/cos_dataset"
+  output_path: "/root/autodl-tmp/RTAP/data/processed/error_correction"
+  # 错误注入配置
+  error_injection:
+    enable: true
+    # 错误注入比例（对原始数据集的比例）
+    injection_ratio: 0.3
+    # 错误类型及其权重
+    error_types:
+      tactic_typo:                     # 策略拼写错误
+        weight: 0.25
+        # 常见拼写错误映射
+        typo_map:
+          "simp": ["simpp", "smp", "sinp"]
+          "apply": ["aply", "appply", "aplly"]
+          "exact": ["excat", "exaxt", "ecact"]
+          "rw": ["wr", "rww", "re"]
+          "intro": ["intto", "inro", "introo"]
+      wrong_tactic:                    # 使用错误的策略
+        weight: 0.25
+        # 策略替换池
+        replacement_pool:
+          - "simp"
+          - "ring"
+          - "norm_num"
+          - "omega"
+          - "trivial"
+          - "assumption"
+      argument_error:                  # 参数错误
+        weight: 0.25
+        # 参数变异方式
+        mutations:
+          - "swap_args"               # 交换参数顺序
+          - "drop_arg"                # 删除参数
+          - "add_random_arg"          # 添加随机参数
+      missing_step:                    # 缺少步骤
+        weight: 0.25
+  # 合成定理配置
+  synthetic_theorems:
+    enable: true
+    num_theorems: 5000                 # 生成合成定理数量
+    # 定理模板类别
+    categories:
+      algebra:                         # 代数恒等式
+        weight: 0.3
+        templates:
+          - "∀ (a b : ℕ), a + b = b + a"
+          - "∀ (a b c : ℕ), (a + b) + c = a + (b + c)"
+          - "∀ (a : ℕ), a * 0 = 0"
+          - "∀ (a b : ℕ), a * b = b * a"
+      logic:                           # 逻辑命题
+        weight: 0.3
+        templates:
+          - "∀ (P Q : Prop), P ∧ Q → Q ∧ P"
+          - "∀ (P Q : Prop), P → P ∨ Q"
+          - "∀ (P : Prop), P → ¬¬P"
+      inequality:                      # 不等式
+        weight: 0.2
+        templates:
+          - "∀ (a : ℕ), 0 ≤ a"
+          - "∀ (a b : ℕ), a ≤ a + b"
+      set_theory:                      # 集合论
+        weight: 0.2
+        templates:
+          - "∀ (s : Set α), s ⊆ s"
+          - "∀ (s t : Set α), s ∩ t ⊆ s"
+  # 错误验证配置（通过 Pantograph 获取真实 Lean4 报错）
+  error_verification:
+    enable: true
+    max_concurrent: 1                    # Pantograph 并发实例数（v4: 单worker彻底消除服务器竞争）
+    batch_save_interval: 500             # 每 500 条保存一次
+
+# ============================================================
+# 最终数据集配置
+# ============================================================
+final_dataset:
+  output_path: "/root/autodl-tmp/RTAP/data/processed/cos_dataset"
+  # 数据集分割
+  split:
+    train_ratio: 0.9
+    val_ratio: 0.05
+    test_ratio: 0.05
+  # 目标数据量
+  target_size: 100000                  # 目标 100k+ 样本
+  # 数据格式：每条样本包含
+  # {theorem, state_pre, thought, cos_chain, tactic, state_post, metadata}
+  format: "jsonl"
+  # 数据校验
+  validation:
+    check_cos_connectivity: true       # 验证 CoS 连通性
+    check_thought_relevance: true      # 验证 Thought 与 Tactic 的相关性
+    remove_duplicates: true            # 去重

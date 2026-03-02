@@ -1,0 +1,922 @@
+"""
+Lean Server 交互接口
+@author ygw
+更新日期: 2026-02-12
+封装 Pantograph repl 的交互接口，提供与 Lean4 证明环境的通信功能。
+支持会话管理、命令发送、状态提取、并发控制等核心能力。
+服务器路径: /root/autodl-tmp/RTAP/workspace/PyPantograph/src/.lake/build/bin/repl
+"""
+
+import os
+import subprocess
+import json
+import time
+import logging
+import threading
+from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from contextlib import contextmanager
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class GoalState:
+    """
+    证明目标状态数据类
+
+    属性:
+        state_id: 状态唯一标识
+        goals: 当前待证明的目标列表
+        raw_response: 原始响应数据
+    """
+    state_id: int = -1
+    goals: List[str] = field(default_factory=list)
+    raw_response: Dict[str, Any] = field(default_factory=dict)
+
+    def is_solved(self) -> bool:
+        """判断是否所有目标已解决"""
+        return len(self.goals) == 0 and self.state_id >= 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """序列化为字典"""
+        return asdict(self)
+
+
+@dataclass
+class TacticResult:
+    """
+    策略执行结果数据类
+
+    属性:
+        success: 策略是否执行成功
+        state_before: 执行前的状态
+        state_after: 执行后的状态
+        tactic: 执行的策略
+        error_message: 错误信息（失败时）
+        duration_ms: 执行耗时（毫秒）
+    """
+    success: bool = False
+    state_before: Optional[GoalState] = None
+    state_after: Optional[GoalState] = None
+    tactic: str = ""
+    error_message: str = ""
+    duration_ms: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """序列化为字典"""
+        return {
+            "success": self.success,
+            "state_before": self.state_before.to_dict() if self.state_before else None,
+            "state_after": self.state_after.to_dict() if self.state_after else None,
+            "tactic": self.tactic,
+            "error_message": self.error_message,
+            "duration_ms": self.duration_ms,
+        }
+
+
+class LeanServer:
+    """
+    Lean4 服务器客户端，用于与 Pantograph repl 交互。
+
+    核心功能:
+    1. 启动/停止 Pantograph repl 进程
+    2. 发送 JSON 命令并接收响应
+    3. 创建证明目标、执行策略、提取状态
+    4. 支持超时控制和错误恢复
+
+    使用示例:
+        server = LeanServer(executable_path="/path/to/repl")
+        server.start()
+        state = server.goal_start("∀ (n : Nat), n + 0 = n")
+        result = server.goal_tactic(state.state_id, "intro n")
+        server.stop()
+    """
+
+    def __init__(self,
+                 executable_path: str = "/root/autodl-tmp/RTAP/workspace/PyPantograph/src/.lake/build/bin/repl",
+                 timeout: int = 30,
+                 project_path: Optional[str] = None,
+                 imports: Optional[List[str]] = None):
+        """
+        初始化 Lean 服务器
+
+        参数:
+            executable_path: Pantograph repl 可执行文件路径
+            timeout: 命令执行超时时间（秒）
+            project_path: Lean 项目路径（用于加载依赖，如 Mathlib4）
+            imports: 启动时导入的模块列表（如 ["Mathlib"]），
+                     Pantograph 默认不导入任何模块（包括 Init）
+        """
+        self.executable_path = executable_path
+        self.timeout = timeout
+        self.project_path = project_path
+        self.imports = imports or []
+        self.process: Optional[subprocess.Popen] = None
+        self._lock = threading.Lock()
+        self._is_running = False
+        self._command_counter = 0
+
+    def start(self) -> bool:
+        """
+        启动 Pantograph repl 进程
+
+        启动方式对齐 PyPantograph:
+        1. 在 project_path 目录下启动（cwd），使 Pantograph 能加载项目依赖
+        2. 通过 lake env printenv LEAN_PATH 获取并设置 LEAN_PATH 环境变量
+        3. 读取 "ready." 信号确认启动成功
+
+        返回:
+            bool: 启动是否成功
+        """
+        if self._is_running:
+            logger.warning("Lean 服务器已在运行中，跳过重复启动")
+            return True
+
+        executable = Path(self.executable_path)
+        if not executable.exists():
+            logger.error(f"Pantograph 可执行文件不存在: {self.executable_path}")
+            return False
+
+        try:
+            # 构建启动命令：repl MODULE1 MODULE2 ... [--option=value]
+            # Pantograph 默认不导入任何模块，必须显式传入（如 Mathlib）
+            cmd = [str(executable)] + self.imports
+
+            # 准备环境变量和工作目录
+            env = os.environ.copy()
+            cwd = None
+
+            if self.project_path:
+                cwd = self.project_path
+                # 通过 lake 获取 LEAN_PATH
+                try:
+                    lean_path_result = subprocess.run(
+                        ["lake", "env", "printenv", "LEAN_PATH"],
+                        cwd=self.project_path,
+                        capture_output=True, text=True, timeout=60
+                    )
+                    if lean_path_result.returncode == 0 and lean_path_result.stdout.strip():
+                        env["LEAN_PATH"] = lean_path_result.stdout.strip()
+                        logger.info(f"LEAN_PATH 已设置: {env['LEAN_PATH'][:100]}...")
+                    else:
+                        logger.warning(f"lake env printenv LEAN_PATH 失败: {lean_path_result.stderr}")
+                except Exception as e:
+                    logger.warning(f"获取 LEAN_PATH 失败: {e}")
+
+            logger.info(f"启动 Pantograph repl: {' '.join(cmd)}, cwd={cwd}")
+
+            self.process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,  # 行缓冲，确保实时通信
+                cwd=cwd,
+                env=env,
+            )
+
+            # 读取 "ready." 信号（Pantograph 启动后第一行输出）
+            try:
+                ready_line = self.process.stdout.readline().strip()
+                if ready_line != "ready.":
+                    logger.error(f"Pantograph 未返回 ready 信号，收到: '{ready_line}'")
+                    # 检查进程是否已退出
+                    if self.process.poll() is not None:
+                        stderr_output = self.process.stderr.read()
+                        logger.error(f"stderr: {stderr_output}")
+                    self.process.terminate()
+                    return False
+                logger.info("Pantograph repl 返回 ready 信号")
+            except Exception as e:
+                logger.error(f"等待 ready 信号失败: {e}")
+                self.process.terminate()
+                return False
+
+            self._is_running = True
+            self._command_counter = 0
+            logger.info("Pantograph repl 启动成功")
+            return True
+
+        except FileNotFoundError:
+            logger.error(f"找不到可执行文件: {self.executable_path}")
+            return False
+        except PermissionError:
+            logger.error(f"没有执行权限: {self.executable_path}")
+            return False
+        except Exception as e:
+            logger.error(f"启动 Lean 服务器失败: {e}")
+            return False
+
+    def stop(self):
+        """停止 Pantograph repl 进程，释放资源"""
+        if self.process:
+            try:
+                self.process.stdin.close()
+                self.process.terminate()
+                # 等待进程退出，最多等 5 秒
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # 强制杀死进程
+                self.process.kill()
+                self.process.wait()
+                logger.warning("Pantograph repl 未能正常退出，已强制终止")
+            except Exception as e:
+                logger.error(f"停止 Lean 服务器时出错: {e}")
+            finally:
+                self.process = None
+                self._is_running = False
+                logger.info("Pantograph repl 已停止")
+
+    def is_running(self) -> bool:
+        """
+        检查服务器是否在运行
+
+        返回:
+            bool: 是否在运行
+        """
+        if not self._is_running or not self.process:
+            return False
+        # 检查进程是否仍然存活
+        if self.process.poll() is not None:
+            self._is_running = False
+            return False
+        return True
+
+    def send_command(self, command: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        发送 JSON 命令到 Pantograph repl 并接收响应
+
+        Pantograph repl 协议格式: cmd_name json_payload\n
+        例如: goal.start {"expr": "∀ (n : Nat), n + 0 = n"}\n
+
+        参数:
+            command: 命令字典，必须包含 "cmd" 字段指定命令名，其余字段为 payload
+
+        返回:
+            Dict: 服务器响应字典，失败返回 None
+        """
+        if not self.is_running():
+            logger.error("Lean 服务器未运行，无法发送命令")
+            return None
+
+        with self._lock:
+            try:
+                self._command_counter += 1
+
+                # 提取命令名，剩余字段作为 payload
+                cmd_name = command.pop("cmd", "")
+                payload_str = json.dumps(command, ensure_ascii=False)
+                # 恢复 cmd 字段，避免修改调用方的字典
+                command["cmd"] = cmd_name
+                # Pantograph 协议: "cmd_name json_payload\n"
+                command_str = f"{cmd_name} {payload_str}\n"
+
+                logger.debug(f"发送命令 #{self._command_counter}: {command_str.strip()}")
+
+                self.process.stdin.write(command_str)
+                self.process.stdin.flush()
+
+                # 带超时的读取响应
+                response_line = self._read_response_with_timeout()
+                if response_line is None:
+                    logger.error(f"命令 #{self._command_counter} 响应超时")
+                    return None
+
+                response = json.loads(response_line)
+                logger.debug(f"收到响应 #{self._command_counter}: {response_line.strip()[:200]}")
+                return response
+
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON 解析失败: {e}, 原始响应: {response_line}")
+                return None
+            except BrokenPipeError:
+                logger.error("管道已断开，Pantograph repl 可能已崩溃")
+                self._is_running = False
+                return None
+            except Exception as e:
+                logger.error(f"发送命令失败: {e}")
+                return None
+
+    def _read_response_with_timeout(self) -> Optional[str]:
+        """
+        带超时的响应读取
+
+        返回:
+            str: 响应行文本，超时返回 None
+        """
+        import select
+        import sys
+
+        # Windows 不支持 select 对管道操作，使用线程方式
+        if sys.platform == "win32":
+            return self._read_response_thread_timeout()
+
+        # Linux/Mac 使用 select
+        try:
+            ready, _, _ = select.select([self.process.stdout], [], [], self.timeout)
+            if ready:
+                return self.process.stdout.readline()
+            return None
+        except Exception:
+            return self._read_response_thread_timeout()
+
+    def _read_response_thread_timeout(self) -> Optional[str]:
+        """
+        使用线程实现带超时的响应读取（兼容 Windows）
+
+        返回:
+            str: 响应行文本，超时返回 None
+        """
+        result = [None]
+
+        def read_line():
+            try:
+                result[0] = self.process.stdout.readline()
+            except Exception:
+                result[0] = None
+
+        thread = threading.Thread(target=read_line, daemon=True)
+        thread.start()
+        thread.join(timeout=self.timeout)
+
+        if thread.is_alive():
+            logger.warning(f"读取响应超时（{self.timeout}秒）")
+            return None
+        return result[0]
+
+    # ================================================================
+    # 高级 API：证明目标管理
+    # ================================================================
+
+    def goal_start(self, expr: str) -> Optional[GoalState]:
+        """
+        创建新的证明目标
+
+        参数:
+            expr: Lean4 表达式字符串（如 "∀ (n : Nat), n + 0 = n"）
+
+        返回:
+            GoalState: 初始目标状态，失败返回 None
+        """
+        response = self.send_command({
+            "cmd": "goal.start",
+            "expr": expr
+        })
+
+        if response is None:
+            return None
+
+        if "error" in response:
+            logger.error(f"创建目标失败: {response['error']}")
+            return None
+
+        state = GoalState(
+            state_id=response.get("stateId", -1),
+            goals=response.get("goals", []),
+            raw_response=response
+        )
+        logger.info(f"创建目标成功，state_id={state.state_id}, 目标数={len(state.goals)}")
+        return state
+
+    def goal_start_copy(self, copy_from: str) -> Optional[GoalState]:
+        """
+        从已有定理/定义创建证明目标（使用 copyFrom 参数）
+
+        相比 goal_start(expr)，此方法直接引用环境中已有的常量名，
+        无需手动获取类型表达式，更可靠。
+
+        参数:
+            copy_from: 常量全名（如 "Nat.add_comm"）
+
+        返回:
+            GoalState: 初始目标状态，失败返回 None
+        """
+        response = self.send_command({
+            "cmd": "goal.start",
+            "copyFrom": copy_from
+        })
+
+        if response is None:
+            return None
+
+        if "error" in response:
+            logger.error(f"copyFrom 创建目标失败 ({copy_from}): {response['error']}")
+            return None
+
+        state = GoalState(
+            state_id=response.get("stateId", -1),
+            goals=response.get("goals", []),
+            raw_response=response
+        )
+        logger.info(f"copyFrom 创建目标成功 ({copy_from})，state_id={state.state_id}")
+        return state
+
+    def goal_start_with_fallback(self, theorem_full_name: str) -> Optional[GoalState]:
+        """
+        创建证明目标，带多级回退策略
+
+        回退顺序:
+        1. copyFrom（直接引用常量名）
+        2. env.inspect 获取类型 → goal.start(expr=type)
+
+        参数:
+            theorem_full_name: 定理全名（如 "Nat.add_comm"）
+
+        返回:
+            GoalState: 初始目标状态，所有策略均失败返回 None
+        """
+        # 策略 1: copyFrom
+        state = self.goal_start_copy(theorem_full_name)
+        if state is not None:
+            return state
+
+        # 策略 2: env.inspect 获取类型，再用 expr 创建
+        logger.info(f"copyFrom 失败，尝试 env.inspect 回退: {theorem_full_name}")
+        inspect_result = self.env_inspect(theorem_full_name)
+        if inspect_result and "type" in inspect_result:
+            type_info = inspect_result["type"]
+            # type_info 可能是 dict（pp 格式）或 str
+            if isinstance(type_info, dict):
+                type_expr = type_info.get("pp", type_info.get("default", ""))
+            else:
+                type_expr = str(type_info)
+
+            if type_expr:
+                state = self.goal_start(type_expr)
+                if state is not None:
+                    logger.info(f"env.inspect 回退成功: {theorem_full_name}")
+                    return state
+
+        logger.warning(f"所有 goal_start 策略均失败: {theorem_full_name}")
+        return None
+
+    def goal_tactic(self, state_id: int, tactic: str) -> TacticResult:
+        """
+        在指定状态上执行策略
+
+        参数:
+            state_id: 目标状态 ID
+            tactic: 要执行的策略字符串
+
+        返回:
+            TacticResult: 策略执行结果
+        """
+        start_time = time.time()
+
+        response = self.send_command({
+            "cmd": "goal.tactic",
+            "stateId": state_id,
+            "tactic": tactic
+        })
+
+        duration_ms = (time.time() - start_time) * 1000
+
+        if response is None:
+            return TacticResult(
+                success=False,
+                tactic=tactic,
+                error_message="服务器无响应",
+                duration_ms=duration_ms
+            )
+
+        if "error" in response:
+            return TacticResult(
+                success=False,
+                tactic=tactic,
+                error_message=response.get("desc", response["error"]),
+                duration_ms=duration_ms
+            )
+
+        if "parseError" in response:
+            return TacticResult(
+                success=False,
+                tactic=tactic,
+                error_message=response.get("parseError", "parse error"),
+                duration_ms=duration_ms
+            )
+
+        # Pantograph: 策略失败时无 goals 字段，通过 messages 返回错误信息
+        # messages 可能是 List[str] 或 List[Dict]（含 severity/data 字段）
+        if "goals" not in response:
+            messages = response.get("messages", [])
+            if messages:
+                parts = []
+                for m in messages:
+                    if isinstance(m, str):
+                        parts.append(m)
+                    elif isinstance(m, dict):
+                        parts.append(m.get("data", m.get("desc", str(m))))
+                    else:
+                        parts.append(str(m))
+                error_msg = "; ".join(parts)
+            else:
+                error_msg = "tactic failed (no goals in response)"
+            return TacticResult(
+                success=False,
+                tactic=tactic,
+                error_message=error_msg,
+                duration_ms=duration_ms
+            )
+
+        # 解析新状态（Pantograph goal.tactic 返回 nextStateId，不是 stateId）
+        next_state_id = response.get("nextStateId", response.get("stateId", -1))
+        new_state = GoalState(
+            state_id=next_state_id,
+            goals=response.get("goals", []),
+            raw_response=response
+        )
+
+        return TacticResult(
+            success=True,
+            state_after=new_state,
+            tactic=tactic,
+            duration_ms=duration_ms
+        )
+
+    def goal_print(self, state_id: int) -> Optional[str]:
+        """
+        打印指定状态的详细信息
+
+        参数:
+            state_id: 目标状态 ID
+
+        返回:
+            str: 状态的文本表示，失败返回 None
+        """
+        response = self.send_command({
+            "cmd": "goal.print",
+            "stateId": state_id
+        })
+
+        if response is None:
+            return None
+
+        if "error" in response:
+            logger.error(f"打印状态失败: {response['error']}")
+            return None
+
+        return response.get("state", str(response))
+
+    def goal_delete(self, state_id: int) -> bool:
+        """
+        删除指定状态，释放服务器端资源
+
+        参数:
+            state_id: 目标状态 ID
+
+        返回:
+            bool: 是否删除成功
+        """
+        response = self.send_command({
+            "cmd": "goal.delete",
+            "stateIds": [state_id]
+        })
+        return response is not None and "error" not in response
+
+    def env_inspect(self, name: str) -> Optional[Dict[str, Any]]:
+        """
+        查询 Lean 环境中常量的类型信息
+
+        通过 Pantograph 的 env.inspect 命令获取指定常量（定理/定义）的类型表达式，
+        可用于 goal_start 创建证明目标。
+
+        参数:
+            name: 常量的完整名称（如 "Nat.add_comm"）
+
+        返回:
+            Dict: 包含 "type" 等字段的响应字典，失败返回 None
+        """
+        response = self.send_command({
+            "cmd": "env.inspect",
+            "name": name,
+            "value": False,
+            "dependency": False,
+        })
+
+        if response is None:
+            return None
+
+        if "error" in response:
+            logger.error(f"env.inspect 失败 ({name}): {response.get('desc', response.get('error', ''))}")
+            return None
+
+        return response
+
+    # ================================================================
+    # 高级 API：证明轨迹提取
+    # ================================================================
+
+    def run_proof(self, theorem_expr: str, tactics: List[str]) -> List[TacticResult]:
+        """
+        执行完整的证明过程，记录每一步的状态变化
+
+        参数:
+            theorem_expr: 定理表达式
+            tactics: 策略列表
+
+        返回:
+            List[TacticResult]: 每步策略的执行结果
+        """
+        results = []
+
+        # 创建初始目标
+        initial_state = self.goal_start(theorem_expr)
+        if initial_state is None:
+            logger.error(f"无法创建证明目标: {theorem_expr}")
+            return results
+
+        current_state_id = initial_state.state_id
+
+        for i, tactic in enumerate(tactics):
+            # 执行策略前，先获取当前状态
+            state_before_text = self.goal_print(current_state_id)
+
+            result = self.goal_tactic(current_state_id, tactic)
+
+            # 补充执行前状态信息
+            if state_before_text:
+                result.state_before = GoalState(
+                    state_id=current_state_id,
+                    goals=[state_before_text]
+                )
+
+            results.append(result)
+
+            if not result.success:
+                logger.warning(f"策略执行失败 (步骤 {i+1}/{len(tactics)}): "
+                             f"tactic='{tactic}', error='{result.error_message}'")
+                break
+
+            # 更新当前状态
+            if result.state_after:
+                current_state_id = result.state_after.state_id
+
+                # 检查是否已完成证明
+                if result.state_after.is_solved():
+                    logger.info(f"证明完成！共 {i+1} 步")
+                    break
+
+        return results
+
+    def extract_state_pair(self, theorem_expr: str, tactic: str,
+                           preceding_tactics: Optional[List[str]] = None
+                           ) -> Optional[Tuple[str, str]]:
+        """
+        提取单个策略执行前后的状态对 (S_pre, S_post)
+
+        参数:
+            theorem_expr: 定理表达式
+            tactic: 目标策略
+            preceding_tactics: 在目标策略之前需要执行的策略列表
+
+        返回:
+            Tuple[str, str]: (执行前状态, 执行后状态)，失败返回 None
+        """
+        initial_state = self.goal_start(theorem_expr)
+        if initial_state is None:
+            return None
+
+        current_state_id = initial_state.state_id
+
+        # 先执行前置策略
+        if preceding_tactics:
+            for pre_tactic in preceding_tactics:
+                result = self.goal_tactic(current_state_id, pre_tactic)
+                if not result.success:
+                    logger.warning(f"前置策略执行失败: {pre_tactic}")
+                    return None
+                if result.state_after:
+                    current_state_id = result.state_after.state_id
+
+        # 获取执行前状态
+        state_pre = self.goal_print(current_state_id)
+        if state_pre is None:
+            return None
+
+        # 执行目标策略
+        result = self.goal_tactic(current_state_id, tactic)
+        if not result.success:
+            return None
+
+        # 获取执行后状态
+        state_post = ""
+        if result.state_after:
+            if result.state_after.is_solved():
+                state_post = "goals accomplished"
+            else:
+                post_text = self.goal_print(result.state_after.state_id)
+                state_post = post_text if post_text else ""
+
+        return (state_pre, state_post)
+
+    # ================================================================
+    # 上下文管理器支持
+    # ================================================================
+
+    def __enter__(self):
+        """支持 with 语句"""
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """退出时自动停止服务器"""
+        self.stop()
+        return False
+
+
+@contextmanager
+def create_lean_server(executable_path: str = None,
+                       timeout: int = 30,
+                       project_path: str = None,
+                       imports: Optional[List[str]] = None):
+    """
+    创建 LeanServer 的上下文管理器工厂函数
+
+    参数:
+        executable_path: Pantograph repl 可执行文件路径
+        timeout: 命令超时时间（秒）
+        project_path: Lean 项目路径
+        imports: 启动时导入的模块列表（如 ["Mathlib"]）
+
+    使用示例:
+        with create_lean_server(imports=["Mathlib"]) as server:
+            state = server.goal_start("∀ (n : Nat), n + 0 = n")
+            result = server.goal_tactic(state.state_id, "intro n")
+    """
+    if executable_path is None:
+        executable_path = "/root/autodl-tmp/RTAP/workspace/PyPantograph/src/.lake/build/bin/repl"
+
+    server = LeanServer(
+        executable_path=executable_path,
+        timeout=timeout,
+        project_path=project_path,
+        imports=imports
+    )
+
+    try:
+        if not server.start():
+            raise RuntimeError("无法启动 Pantograph repl")
+        yield server
+    finally:
+        server.stop()
+
+
+class LeanServerPool:
+    """
+    Lean 服务器连接池，支持并发场景下的多实例管理。
+
+    用于 CoS 提取等需要并发访问 Pantograph 的场景。
+
+    使用示例:
+        pool = LeanServerPool(max_size=4)
+        pool.start_all()
+        server = pool.acquire()
+        # ... 使用 server ...
+        pool.release(server)
+        pool.stop_all()
+    """
+
+    def __init__(self,
+                 max_size: int = 4,
+                 executable_path: str = None,
+                 timeout: int = 30,
+                 project_path: str = None,
+                 imports: Optional[List[str]] = None):
+        """
+        初始化服务器连接池
+
+        参数:
+            max_size: 最大连接数
+            executable_path: Pantograph repl 可执行文件路径
+            timeout: 命令超时时间（秒）
+            project_path: Lean 项目路径
+            imports: 启动时导入的模块列表（如 ["Mathlib"]）
+        """
+        if executable_path is None:
+            executable_path = "/root/autodl-tmp/RTAP/workspace/PyPantograph/src/.lake/build/bin/repl"
+
+        self.max_size = max_size
+        self.executable_path = executable_path
+        self.timeout = timeout
+        self.project_path = project_path
+        self.imports = imports or []
+        self._pool: List[LeanServer] = []
+        self._available: List[LeanServer] = []
+        self._lock = threading.Lock()
+        self._semaphore = threading.Semaphore(max_size)
+
+    def start_all(self) -> int:
+        """
+        启动所有服务器实例
+
+        返回:
+            int: 成功启动的实例数
+        """
+        success_count = 0
+        for i in range(self.max_size):
+            server = LeanServer(
+                executable_path=self.executable_path,
+                timeout=self.timeout,
+                project_path=self.project_path,
+                imports=self.imports
+            )
+            if server.start():
+                self._pool.append(server)
+                self._available.append(server)
+                success_count += 1
+                logger.info(f"服务器实例 {i+1}/{self.max_size} 启动成功")
+            else:
+                logger.error(f"服务器实例 {i+1}/{self.max_size} 启动失败")
+
+        logger.info(f"服务器池启动完成: {success_count}/{self.max_size} 个实例就绪")
+        return success_count
+
+    def stop_all(self):
+        """停止所有服务器实例"""
+        for server in self._pool:
+            server.stop()
+        self._pool.clear()
+        self._available.clear()
+        logger.info("服务器池已全部停止")
+
+    def acquire(self) -> Optional[LeanServer]:
+        """
+        从池中获取一个可用的服务器实例（阻塞等待）
+
+        返回:
+            LeanServer: 可用的服务器实例，池耗尽返回 None
+        """
+        self._semaphore.acquire()
+        with self._lock:
+            if self._available:
+                server = self._available.pop()
+                # 检查服务器是否仍然存活
+                if server.is_running():
+                    return server
+                else:
+                    # 尝试重启
+                    logger.warning("获取到的服务器实例已停止，尝试重启")
+                    if server.start():
+                        return server
+                    # 重启失败，从池中移除该实例
+                    if server in self._pool:
+                        self._pool.remove(server)
+                    logger.error("服务器实例重启失败，已从池中移除")
+                    self._semaphore.release()
+                    return None
+            # 可用列表为空（不应发生，但防御性处理）
+            logger.error("服务器池可用列表为空")
+            self._semaphore.release()
+            return None
+
+    def release(self, server: LeanServer):
+        """
+        归还服务器实例到池中
+
+        参数:
+            server: 要归还的服务器实例
+        """
+        with self._lock:
+            if server.is_running():
+                self._available.append(server)
+            else:
+                # 服务器已停止，尝试重启后归还
+                logger.warning("归还的服务器实例已停止，尝试重启")
+                if server.start():
+                    self._available.append(server)
+                else:
+                    # 重启失败，从池中移除
+                    if server in self._pool:
+                        self._pool.remove(server)
+                    logger.error("服务器实例重启失败，已从池中移除")
+        self._semaphore.release()
+
+    @contextmanager
+    def get_server(self):
+        """
+        上下文管理器方式获取和归还服务器
+
+        使用示例:
+            with pool.get_server() as server:
+                state = server.goal_start(expr)
+        """
+        server = self.acquire()
+        if server is None:
+            raise RuntimeError("无法从池中获取服务器实例")
+        try:
+            yield server
+        finally:
+            self.release(server)
+
+    def __enter__(self):
+        """支持 with 语句"""
+        self.start_all()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """退出时自动停止所有实例"""
+        self.stop_all()
+        return False

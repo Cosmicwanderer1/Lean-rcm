@@ -1,0 +1,216 @@
+# ============================================================
+# Reflection 生成配置
+# @author ygw
+# 日期: 2026-03-01
+# 用途: Task 2.3 — 认知修复与 <reflection> 标注
+# ============================================================
+
+# 全局设置
+global:
+  project_root: "/root/autodl-tmp/RTAP"
+  random_seed: 42
+  log_level: "INFO"
+
+# ============================================================
+# Phase 1: 数据过滤配置
+# ============================================================
+data_filter:
+  # 输入：错误注入 + Pantograph 验证后的数据
+  input_path: "/root/autodl-tmp/RTAP/data/processed/error_correction/error_injection_verified.jsonl"
+  # 保留哪些 verification_status（仅保留真正失败的记录）
+  # v2: 仅保留 Pantograph 真正验证通过的记录
+  # （错误策略确实触发了 Lean4 报错，error_message 为真实 Lean4 报错文本）
+  # @author ygw 2026-03-01
+  valid_statuses:
+    - "verified"
+  # 必须具备的字段
+  required_fields:
+    - "error_message"
+    - "state_before"
+    - "original_tactic"
+    - "error_tactic"
+    - "error_type"
+    - "repair_hint"
+  # 最大采样数（0 = 不限制，处理所有符合条件的记录）
+  max_samples: 0
+  # 每种错误类型的最大采样数（0 = 不限制）
+  max_per_error_type: 0
+
+# ============================================================
+# Phase 2: Reflection 生成配置
+# ============================================================
+reflection_generation:
+  # Teacher Model 配置（复用 data_pipeline.yaml 的模型参数）
+  teacher_model:
+    provider: "deepseek-v3"
+    model_name: "deepseek-chat"
+    api_base: "https://api.deepseek.com/v1"
+    api_key_env: "DEEPSEEK_API_KEY"
+    fallback:
+      provider: "openai"
+      model_name: "gpt-4o"
+      api_base: "https://api.openai.com/v1"
+      api_key_env: "OPENAI_API_KEY"
+
+  # 生成参数 (v2.1: max_tokens 600→800，给 API 更充裕的输出空间)
+  generation:
+    temperature: 0.7
+    max_tokens: 800
+    top_p: 0.95
+
+  # Prompt 模板 (v2: 增加 repair_hint + 抗误导指令)
+  # @author ygw 2026-03-02 优化：引导模型关注证明状态与正确策略
+  prompt_template: |
+    You are a Lean4 proof error analyst. Given a proof step that failed, analyze the error and explain the correct fix.
+
+    [Proof State]
+    {state_before}
+
+    [Correct Tactic]
+    {original_tactic}
+
+    [Attempted (Wrong) Tactic]
+    {error_tactic}
+
+    [Error Type]
+    {error_type}
+
+    [Repair Hint]
+    {repair_hint}
+
+    [Lean4 Error Message]
+    {error_message}
+
+    [Critical Rules]
+    Write 2-4 sentences explaining the error and the fix. Follow this reasoning order:
+    1. FIRST, analyze the proof state and explain WHY the correct tactic `{original_tactic}` is the right choice for this goal
+    2. THEN, explain the semantic gap between the attempted tactic `{error_tactic}` and the correct tactic — what conceptual mistake does the wrong tactic represent?
+    3. Finally, briefly note the error type ({error_type}) and how the repair hint applies
+
+    IMPORTANT:
+    - The Lean4 error message may be MISLEADING or refer to internal elaboration details. Do NOT simply parrot the error message. Instead, focus on the structural mismatch between the attempted tactic and the proof goal.
+    - Always reference the correct tactic `{original_tactic}` explicitly in your explanation.
+    - You MUST incorporate the repair hint text into your explanation: "{repair_hint}"
+    - Reference the proof goal (the line after ⊢) when explaining why the correct tactic fits.
+    - Be specific: cite exact identifiers, types, or expressions from the proof state.
+    - Do NOT use vague phrases: "obviously", "clearly", "trivially", "it is easy to see"
+    - Do NOT restate the problem or add headings/numbering
+    - Output the reflection text directly with no XML tags or prefixes
+    - Write in English
+
+  # 批处理参数
+  batch:
+    batch_size: 30
+    max_concurrent_requests: 25
+    rate_limit_rpm: 500
+    save_interval: 2000           # 每处理 N 条保存一次中间结果
+
+  # 质量过滤 (v2.1: max_length 800→1500，避免拒绝高质量 API 输出)
+  quality_filter:
+    min_length: 40                # Reflection 最小字符数
+    max_length: 1500              # Reflection 最大字符数
+    forbidden_patterns:
+      - "I don't know"
+      - "I'm not sure"
+      - "I cannot determine"
+      - "无法确定"
+      - "As an AI"
+    # 至少命中一个关键词（空 = 不检查）
+    require_keywords: []
+
+  # 模板回退（API 不可用时使用）(v3: 多变体 + error_message 集成 + 假设提取)
+  # @author ygw 2026-03-02 v3 重构：
+  #   - 每种错误类型 3 个结构变体，确定性选择提升多样性
+  #   - 集成 {error_message_short}（Lean4 真实报错摘要）
+  #   - 集成 {hypotheses_clause}（从 state_before 提取的假设上下文）
+  #   - 与 API Prompt 三步推理结构对齐：正确策略 → 语义偏差 → 错误类型+hint
+  #   - 消除泛化描述，引用具体 goal/hypothesis 信息
+  # 注意: v3 的核心模板定义在 Python 代码中（REFLECTION_TEMPLATES 常量），
+  #       此处 YAML 值会作为 **追加变体** 合并到代码内置模板池中。
+  #       若 YAML 中某个 key 的值为列表，则直接替换该错误类型的全部变体。
+  # 可用占位符: {error_tactic}, {original_tactic}, {error_type}, {error_message},
+  #   {error_message_short}, {repair_hint}, {state_before}, {state_summary},
+  #   {hypotheses_clause}
+  template_fallback:
+    enable: true
+    templates:
+      # YAML 模板作为第 4 个追加变体（可选，保留以便灵活覆盖）
+      tactic_typo: >
+        The correct tactic `{original_tactic}` properly references a valid declaration
+        for goal {state_summary}{hypotheses_clause}.
+        The attempted `{error_tactic}` contains a character-level typo that prevents
+        Lean4 name resolution, causing: {error_message_short}.
+        This is a tactic_typo error; {repair_hint}.
+      wrong_tactic: >
+        The goal {state_summary}{hypotheses_clause} requires `{original_tactic}`,
+        which applies the correct transformation matching the proof obligation.
+        `{error_tactic}` addresses a different mathematical structure entirely,
+        and Lean4 rejects it: {error_message_short}.
+        This is a wrong_tactic error; {repair_hint}.
+      argument_error: >
+        For goal {state_summary}{hypotheses_clause},
+        `{original_tactic}` supplies correctly-typed arguments matching the context.
+        `{error_tactic}` provides mismatched arguments — wrong types, wrong order,
+        or references to unavailable terms — causing: {error_message_short}.
+        This is an argument_error; {repair_hint}.
+      missing_step: >
+        The goal {state_summary}{hypotheses_clause} has a logical gap that
+        `{error_tactic}` attempts to jump over.
+        `{original_tactic}` provides the necessary intermediate step to bridge this gap.
+        Without it, Lean4 reports: {error_message_short}.
+        This is a missing_step error; {repair_hint}.
+
+# ============================================================
+# 分批执行配置（分期付款模式）
+# @author ygw 2026-03-02 新增
+# 将 119K 条记录分成 N 个批次，每次运行处理 1 个批次，
+# 降低单次 API 费用，支持断点恢复和进度跟踪。
+#
+# 使用方式:
+#   # 分 6 批执行（每批约 20K 条，费用约 50 元）
+#   python scripts/build_reflection_data.py --config configs/reflection_generation.yaml --batch-id 1 --total-batches 6
+#   python scripts/build_reflection_data.py --config configs/reflection_generation.yaml --batch-id 2 --total-batches 6
+#   # ...隔天继续...
+#
+#   # 查看进度
+#   python scripts/build_reflection_data.py --config configs/reflection_generation.yaml --batch-status
+#
+#   # 全部完成后合并 → SFT 数据集
+#   python scripts/build_reflection_data.py --config configs/reflection_generation.yaml --merge
+# ============================================================
+batch_execution:
+  total_batches: 6                # 默认分 6 批
+  # 预估（119K 条, DeepSeek-V3）:
+  #   每批: ~20K 条, ~50 元, ~45 分钟 (25 并发 500RPM)
+  #   总计: ~300 元, ~4.5 小时 (分 6 次)
+
+# ============================================================
+# Phase 3: SFT 数据集构建配置
+# ============================================================
+sft_dataset:
+  output_path: "/root/autodl-tmp/RTAP/data/processed/error_correction"
+  # 数据集分割
+  split:
+    train_ratio: 0.90
+    val_ratio: 0.05
+    test_ratio: 0.05
+  # 输出文件名
+  filenames:
+    full: "reflection_dataset.jsonl"
+    train: "reflection_train.jsonl"
+    val: "reflection_val.jsonl"
+    test: "reflection_test.jsonl"
+    stats: "reflection_stats.json"
+  # 指令格式化模板（SFT 训练时的 instruction 格式）
+  instruction_template: |
+    You are proving a Lean4 theorem. The following tactic was attempted but failed.
+    Analyze the error and explain what went wrong and how to fix it.
+
+    [Proof State]
+    {state_before}
+
+    [Attempted Tactic]
+    {error_tactic}
+
+    [Error Message]
+    {error_message}

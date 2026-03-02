@@ -1,0 +1,100 @@
+# SFT 训练超参数配置
+# @author ygw
+# DeepSeek-Prover-V2-7B LoRA 微调配置
+
+# 模型配置
+model:
+  # 优先使用本地路径，不存在则从 HuggingFace 下载
+  base_model: "deepseek-ai/DeepSeek-Prover-V2-7B"
+  local_model_path: "/root/autodl-tmp/models/DeepSeek-Prover-V2-7B"
+  model_type: "causal_lm"
+  max_length: 2048
+  torch_dtype: "bfloat16"
+
+# LoRA 配置
+lora:
+  enabled: true
+  r: 16
+  lora_alpha: 32
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  lora_dropout: 0.05
+  task_type: "CAUSAL_LM"
+
+# 训练配置
+training:
+  # Phase 1: 基础 SFT — State → Thought + Tactic
+  phase1:
+    epochs: 3
+    per_device_train_batch_size: 4
+    per_device_eval_batch_size: 4
+    learning_rate: 2e-5
+    warmup_ratio: 0.05
+    gradient_accumulation_steps: 8
+    max_grad_norm: 1.0
+    weight_decay: 0.01
+    bf16: true
+    logging_steps: 50
+    save_steps: 500
+    eval_steps: 500
+    save_total_limit: 3
+
+  # Phase 2: CoS-Tactic 联合训练（后续实现）
+  phase2:
+    epochs: 5
+    per_device_train_batch_size: 2
+    per_device_eval_batch_size: 2
+    learning_rate: 1e-5
+    warmup_ratio: 0.03
+    gradient_accumulation_steps: 16
+    max_grad_norm: 1.0
+    weight_decay: 0.01
+    bf16: true
+    logging_steps: 50
+    save_steps: 500
+    eval_steps: 500
+    save_total_limit: 3
+
+# 优化器配置
+optimizer:
+  type: "adamw_torch"
+  beta1: 0.9
+  beta2: 0.999
+  epsilon: 1e-8
+
+# 学习率调度
+lr_scheduler:
+  type: "cosine"
+
+# 数据配置
+data:
+  # Phase 1 主任务: State → Thought + Tactic (已预划分)
+  train_dataset: "data/processed/cos_dataset/train.jsonl"
+  val_dataset: "data/processed/cos_dataset/val.jsonl"
+  test_dataset: "data/processed/cos_dataset/test.jsonl"
+  # 辅助任务: 错误修正数据 (可选混合训练)
+  error_correction_dataset: "data/processed/error_correction/error_correction_train.jsonl"
+  use_error_correction: true
+  seed: 42
+  num_workers: 4
+
+# 系统提示词
+prompts:
+  phase1_system: >
+    You are a Lean 4 theorem proving assistant. Given a proof state,
+    first provide a brief reasoning (Thought) explaining your strategy,
+    then output the exact Lean 4 tactic to apply.
+    Rules:
+    - Thought: 1-3 sentences explaining the reasoning.
+    - Tactic: exactly one Lean 4 tactic, no code fences.
+    - Never use sorry or admit.
+
+# 检查点配置
+checkpoint:
+  output_dir: "checkpoints/sft_phase1"
+  resume_from: null
+
+# 日志配置
+logging:
+  use_wandb: true
+  project_name: "rtap-v3-sft"
+  run_name: "phase1-deepseek-prover-v2-lora"

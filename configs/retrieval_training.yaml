@@ -1,0 +1,41 @@
+# ============================================================
+# 检索增强训练数据构建配置 (Task 2.2)
+# @author ygw
+# 创建日期: 2026-03-01
+#
+# 三阶段流水线配置:
+#   Phase 1: 正样本对提取 — 从 cos_flat 中解析 tactic 引用的前提
+#   Phase 2: 硬负样本挖掘 — 利用 FAISS 索引检索近邻，排除正样本
+#   Phase 3: 训练集构建   — 格式化、按定理名分割 train/val/test
+#
+# 用法:
+#   python scripts/build_retrieval_training_data.py --config configs/retrieval_training.yaml
+# ============================================================
+
+retrieval_training:
+  # ---- 输入数据路径 ----
+  cos_flat_path: "data/processed/cos_dataset/cos_flat.jsonl"       # CoS 展平数据（182K 条）
+  corpus_path: "data/vector_db/corpus.jsonl"                       # 定理语料库（54K 条）
+  retrieval_config: "configs/retrieval.yaml"                       # 检索器配置（FAISS 索引路径等）
+
+  # ---- 输出路径 ----
+  positive_pairs_path: "data/retrieval_training/positive_pairs.jsonl"
+  triplets_path: "data/retrieval_training/training_triplets.jsonl"
+  output_dir: "data/retrieval_training"
+
+  # ---- Phase 1: 正样本对提取参数 ----
+  min_state_length: 20         # state_before 最短字符数（过短过滤）
+  max_state_length: 2048       # state_before 最长字符数（过长过滤）
+
+  # ---- Phase 2: 硬负样本挖掘参数 ----
+  num_negatives: 7             # 每条正样本的硬负样本数量
+  retrieval_top_k: 50          # FAISS 检索返回的候选数（需 > num_negatives）
+  mining_batch_size: 64        # 批量编码/检索时的 batch size
+
+  # ---- Phase 3: 训练集构建参数 ----
+  max_query_length: 1024       # query（proof state）最大截断长度
+  max_passage_length: 256      # passage（premise 文本）最大截断长度
+  train_ratio: 0.90            # 训练集比例
+  val_ratio: 0.05              # 验证集比例
+  test_ratio: 0.05             # 测试集比例
+  seed: 42                     # 随机种子（控制分割可复现性）

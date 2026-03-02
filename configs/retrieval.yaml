@@ -1,0 +1,125 @@
+# RAG-CoS-MCTS 检索系统配置
+# @author ygw
+# Task 1.2: 稠密检索 (Dense Retrieval) 后端
+# 更新日期: 2026-02-28
+
+# ============================================================
+# 全局设置
+# ============================================================
+global:
+  project_root: "/root/autodl-tmp/RTAP"
+  device: "cuda"                       # cuda / cpu (4090 24GB)
+  log_level: "INFO"
+
+# ============================================================
+# 语料库构建
+# ============================================================
+corpus:
+  # 数据源选择: traces / pantograph / json
+  source: "traces"
+  # traces 数据源配置
+  traces:
+    input_path: "data/processed/traces/traces_with_states.jsonl"
+    # 从 traces 中提取的字段映射
+    name_field: "theorem_full_name"
+    type_field: "theorem_type"
+    module_field: "file_path"
+    # 去重策略: 按 theorem_full_name 去重
+    deduplicate: true
+  # Pantograph 数据源配置（从 Lean 环境直接提取）
+  pantograph:
+    project_path: "workspace/PyPantograph"
+    imports: ["Init"]
+    batch_size: 500                    # 每批 env_inspect 数量
+    timeout: 300                       # 总超时（秒）
+  # 输出路径
+  output_path: "data/vector_db/corpus.jsonl"
+  # 语料库统计输出
+  stats_path: "data/vector_db/corpus_stats.json"
+
+# ============================================================
+# 稠密检索编码模型
+# ============================================================
+encoder:
+  # 阶段 1：用轻量模型验证全链路（334M 参数，~1.3GB）
+  # 阶段 2：可切换为 E5-mistral-7b-instruct
+  model_name: "intfloat/e5-large-v2"
+  # model_name: "intfloat/e5-mistral-7b-instruct"  # 7B 大模型，效果最优
+  # 国内镜像（如 HuggingFace 不可达）
+  # model_name: "/root/autodl-tmp/models/e5-large-v2"
+  device: "cuda"
+  # E5 模型需要的前缀
+  query_prefix: "query: "
+  passage_prefix: "passage: "
+  # 编码参数
+  encode_batch_size: 64                # 编码批次大小（4090 24GB 可用 64-128）
+  normalize_embeddings: true           # L2 归一化（用于余弦相似度）
+  max_seq_length: 512                  # 最大序列长度
+  show_progress: true                  # 显示编码进度条
+
+# ============================================================
+# FAISS 索引配置
+# ============================================================
+faiss_index:
+  # 索引类型: flat / ivf_flat / ivf_pq
+  #   flat: 精确搜索，适合 <10万
+  #   ivf_flat: 近似搜索，适合 10万~100万
+  #   ivf_pq: 量化近似搜索，适合 >100万
+  index_type: "ivf_flat"
+  # IVF 参数
+  nlist: 256                           # 聚类中心数（sqrt(N) 左右最优）
+  nprobe: 32                           # 搜索时探测的聚类数（越大越精确，越慢）
+  # PQ 参数（仅 ivf_pq 使用）
+  pq_m: 64                            # PQ 子空间数
+  pq_nbits: 8                         # 每子空间量化比特数
+  # 距离度量: IP (内积) / L2
+  metric: "IP"                         # 归一化后 IP ≈ 余弦相似度
+  # 持久化路径
+  index_path: "data/vector_db/faiss_index.bin"
+  corpus_meta_path: "data/vector_db/corpus_meta.json"
+
+# ============================================================
+# 符号检索配置
+# ============================================================
+symbolic:
+  # 定理类型签名数据库（与稠密检索共用语料库）
+  corpus_path: "data/vector_db/corpus_meta.json"
+  # 倒排索引参数
+  min_token_length: 2                  # 最小关键词长度
+  # 搜索参数
+  default_top_k: 20
+
+# ============================================================
+# 双粒度检索融合 (DG-RASP)
+# ============================================================
+dual_grained:
+  # RRF 融合参数
+  rrf_k: 60                           # RRF 常数（越大越平滑）
+  # 宏观层：自然语言 → 引理锚定
+  macro:
+    top_k: 5                           # 返回引理数
+    dense_weight: 0.7                  # 稠密检索权重
+    symbolic_weight: 0.3               # 符号检索权重
+  # 微观层：证明状态 → 前提检索
+  micro:
+    top_k: 10                          # 返回前提数
+    dense_weight: 0.5
+    symbolic_weight: 0.5
+  # 缓存配置
+  cache:
+    max_size: 10000                    # 最大缓存条目
+    enable: true
+
+# ============================================================
+# 检索服务运行时配置
+# ============================================================
+serving:
+  # 预加载模型到 GPU
+  preload_model: true
+  # 预加载索引到内存
+  preload_index: true
+  # 查询超时（秒）
+  query_timeout: 10
+  # 默认返回数量
+  default_top_k: 10
+

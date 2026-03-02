@@ -1,0 +1,189 @@
+# RAG-CoS-MCTS 搜索引擎配置
+# @author ygw
+# 配置 MAGC-MCTS 两级搜索 + DG-RASP 检索 + RCRL 反思修复
+# 更新日期: 2026-02-28
+
+# ============================================================
+# 全局配置
+# ============================================================
+global:
+  project_root: "/root/autodl-tmp/RTAP"
+  log_level: "INFO"
+  device: "cuda"
+  random_seed: 42
+
+# ============================================================
+# MAGC-MCTS 两级搜索配置
+# ============================================================
+mcts:
+  # 外层状态树参数
+  outer:
+    max_iterations: 50                  # 外层最大迭代次数
+    max_depth: 10                       # 外层树最大深度（中间状态上限）
+    exploration_constant: 1.414         # UCB1 探索常数
+    candidate_states_per_expansion: 5   # 每次展开的候选中间状态数
+
+  # 内层战术树参数
+  inner:
+    max_iterations: 200                 # 内层最大迭代次数
+    max_depth: 30                       # 内层树最大深度（单段策略步数上限）
+    exploration_constant: 1.414         # UCB1 探索常数
+    budget: 500                         # 内层总扩展节点预算
+    candidate_tactics_per_expansion: 6  # 每次展开的候选策略数（贪心1 + 采样5）
+
+  # 采样温度
+  temperature:
+    greedy: 0.0                         # 贪心采样
+    diverse: 0.7                        # 多样性采样
+
+  # 搜索预算
+  budget:
+    max_time_seconds: 600               # 单个定理最大搜索时间
+    max_total_expansions: 5000          # 总节点扩展上限
+
+# ============================================================
+# DG-RASP 双粒度检索配置
+# ============================================================
+retrieval:
+  # 宏观层检索（状态锚定）
+  macro:
+    encoder_model: "intfloat/e5-base-v2"  # 编码器模型
+    index_path: "/root/autodl-tmp/RTAP/data/vector_db/macro_index.faiss"
+    corpus_path: "/root/autodl-tmp/RTAP/data/vector_db/macro_corpus.jsonl"
+    top_k: 5                            # 宏观检索返回数
+    embedding_dim: 768                  # 编码维度
+    normalize: true                     # L2 归一化
+
+  # 微观层检索（前提检索）
+  micro:
+    encoder_model: "intfloat/e5-base-v2"
+    index_path: "/root/autodl-tmp/RTAP/data/vector_db/micro_index.faiss"
+    corpus_path: "/root/autodl-tmp/RTAP/data/vector_db/micro_corpus.jsonl"
+    top_k: 10                           # 微观检索返回数
+    embedding_dim: 768
+    normalize: true
+
+  # 符号检索（类型签名匹配）
+  symbolic:
+    enable: true
+    inverted_index_path: "/root/autodl-tmp/RTAP/data/vector_db/type_inverted_index.json"
+    top_k: 5
+    # 权重分配
+    token_overlap_weight: 0.4
+    type_match_weight: 0.6
+
+  # 融合参数
+  fusion:
+    method: "rrf"                       # Reciprocal Rank Fusion
+    rrf_k: 60                           # RRF 调节参数
+    dense_weight: 0.6                   # 稠密检索权重
+    symbolic_weight: 0.4                # 符号检索权重
+
+  # 缓存配置
+  cache:
+    enable: true
+    max_size: 10000                     # 缓存最大条目数
+    ttl_seconds: 3600                   # 缓存过期时间
+
+# ============================================================
+# RCRL 反思修复配置
+# ============================================================
+rcrl:
+  # ETR (Error-Tactic Repair) 参数
+  etr:
+    max_attempts: 3                     # 单次 ETR 最大重试次数
+    temperature: 0.3                    # 修复生成温度
+    num_candidates: 1                   # 每次生成候选数
+
+  # ESR (Error-State Repair) 参数
+  esr:
+    enable: true
+    # 连续 ETR 失败多少次后升级为 ESR
+    escalation_threshold: 3
+
+  # 反思诊断
+  reflection:
+    enable: true                        # 是否启用反思诊断
+    max_reflection_length: 200          # 反思文本最大长度
+
+  # 修复预算
+  budget:
+    max_repairs_per_search: 50          # 单次搜索最大修复次数
+    max_repair_rounds: 2                # 单次修复最大轮次
+
+# ============================================================
+# 状态管理配置
+# ============================================================
+state_manager:
+  max_states: 10000                     # 最大管理状态数
+  # 元变量追踪
+  metavar_tracking:
+    enable: true
+    sync_interval: 1                    # 每多少步同步一次元变量绑定
+  # 去重
+  deduplication:
+    enable: true
+    hash_algorithm: "sha256"
+  # 独立性检测
+  independence_detection:
+    enable: true
+    cache_size: 5000
+
+# ============================================================
+# Pantograph 交互配置
+# ============================================================
+pantograph:
+  executable: "/root/autodl-tmp/RTAP/workspace/PyPantograph/src/.lake/build/bin/repl"
+  lean_path_dirs:
+    - "/root/autodl-tmp/RTAP/workspace/PyPantograph/src/.lake/packages/mathlib/.lake/build/lib"
+    - "/root/autodl-tmp/RTAP/workspace/PyPantograph/src/.lake/build/lib"
+  timeout: 30                           # 单次交互超时（秒）
+  max_concurrent: 6                     # 最大并发实例数
+  pool_size: 4                          # 连接池大小
+
+# ============================================================
+# 模型配置
+# ============================================================
+model:
+  base_model_path: "/root/autodl-tmp/models/DeepSeek-Prover-V2-7B"
+  lora_path: "checkpoints/sft_phase1/final"
+  device: "cuda"
+  dtype: "bfloat16"
+  max_new_tokens: 512
+
+# ============================================================
+# 评估配置
+# ============================================================
+evaluation:
+  benchmarks:
+    - name: "miniF2F-test"
+      dataset: "benchmarks/minif2f_v2/datasets/miniF2F_v2c.jsonl"
+      metrics: ["pass@1", "pass@32", "pass@64"]
+      timeout_per_theorem: 300
+    - name: "ProofNet"
+      dataset: ""  # 待配置
+      metrics: ["pass@1"]
+  # 评估时搜索设置
+  search:
+    outer_iterations: 30
+    inner_iterations: 100
+    inner_budget: 300
+
+# ============================================================
+# Expert Iteration 配置
+# ============================================================
+expert_iteration:
+  num_iterations: 5                     # 迭代轮数
+  # 每轮搜索
+  theorems_per_iteration: 200           # 每轮搜索定理数
+  timeout_per_theorem: 300              # 每个定理超时
+  # 训练
+  learning_rate: 5.0e-6
+  batch_size: 4
+  gradient_accumulation: 4
+  max_steps_per_iter: 500
+  # 数据混合
+  base_data_path: "/root/autodl-tmp/RTAP/data/processed/cos_dataset/train.jsonl"
+  base_ratio: 0.3                       # 基础数据占比
+  # 输出
+  output_dir: "checkpoints/expert_iteration"
