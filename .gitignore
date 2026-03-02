@@ -3,3 +3,6 @@ logs/
 *.json 
 nul  
 logs/  
+assets/  
+workspace/  
+.specstory/  
